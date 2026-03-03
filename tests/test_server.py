@@ -63,7 +63,11 @@ def test_jsonrpc_initialize_tools_list_and_notifications_initialized():
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         )
         assert status == 200
-        assert init_resp["result"]["name"] == APP_NAME
+        assert init_resp["result"] == {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
+        }
 
         status, list_resp = _post_json(
             base + "/mcp",

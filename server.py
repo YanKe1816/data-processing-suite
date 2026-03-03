@@ -169,9 +169,9 @@ def handle_jsonrpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]
     params = payload.get("params", {})
 
     if method == "initialize":
+        negotiated_version = params.get("protocolVersion") or "2024-11-05"
         result = {
-            "name": APP_NAME,
-            "version": APP_VERSION,
+            "protocolVersion": negotiated_version,
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": APP_NAME, "version": APP_VERSION},
         }
