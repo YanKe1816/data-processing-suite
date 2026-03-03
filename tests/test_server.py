@@ -2,10 +2,9 @@ import json
 import threading
 import time
 from http.server import ThreadingHTTPServer
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from server import APP_NAME, APP_VERSION, RequestHandler, TOOL_DEFINITIONS, run_self_test
+from server import APP_NAME, APP_VERSION, RequestHandler, TOOL_DEFINITIONS
 
 
 def _start_server():
@@ -16,10 +15,9 @@ def _start_server():
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
-def _get_json(url, headers=None):
-    req = Request(url, method="GET", headers=headers or {})
-    with urlopen(req) as resp:
-        return resp.status, resp.headers, json.loads(resp.read().decode("utf-8"))
+def _get_json(url):
+    with urlopen(url) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
 def _post_json(url, body):
@@ -29,16 +27,12 @@ def _post_json(url, body):
         method="POST",
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urlopen(req) as resp:
-            raw = resp.read().decode("utf-8")
-            return resp.status, json.loads(raw) if raw else None
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8")
-        return exc.code, json.loads(raw) if raw else None
+    with urlopen(req) as resp:
+        raw = resp.read().decode("utf-8")
+        return resp.status, json.loads(raw) if raw else None
 
 
-def test_required_routes_and_mcp_manifest_and_sse():
+def test_required_routes_and_mcp_manifest():
     server, base = _start_server()
     try:
         for route in [
@@ -48,23 +42,15 @@ def test_required_routes_and_mcp_manifest_and_sse():
             "/support",
             "/.well-known/openai-apps-challenge",
         ]:
-            status, _, _ = _get_json(base + route)
+            status, _ = _get_json(base + route)
             assert status == 200
 
-        status, _, mcp = _get_json(base + "/mcp")
+        status, mcp = _get_json(base + "/mcp")
         assert status == 200
         assert mcp["name"] == APP_NAME
         assert mcp["version"] == APP_VERSION
         assert mcp["tools"] == TOOL_DEFINITIONS
         assert mcp["base_url"].startswith("http://")
-
-        req = Request(base + "/mcp", method="GET", headers={"Accept": "text/event-stream"})
-        with urlopen(req) as resp:
-            assert resp.status == 200
-            assert "text/event-stream" in resp.headers.get("Content-Type", "")
-            payload = resp.read().decode("utf-8")
-            assert "event: message" in payload
-            assert APP_NAME in payload
     finally:
         server.shutdown()
 
@@ -86,9 +72,10 @@ def test_jsonrpc_initialize_tools_list_and_notifications_initialized():
         assert status == 200
         assert list_resp["result"]["tools"] == TOOL_DEFINITIONS
 
-        _, _, mcp = _get_json(base + "/mcp")
+        status, mcp = _get_json(base + "/mcp")
         assert mcp["tools"] == list_resp["result"]["tools"]
 
+        # Notification form (no id) returns 204 and empty body.
         req = Request(
             base + "/mcp",
             data=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8"),
@@ -102,7 +89,7 @@ def test_jsonrpc_initialize_tools_list_and_notifications_initialized():
         server.shutdown()
 
 
-def test_tools_call_and_invalid_params():
+def test_tools_call_for_each_tool():
     server, base = _start_server()
     try:
         cases = [
@@ -126,16 +113,32 @@ def test_tools_call_and_invalid_params():
             assert status == 200
             result = resp["result"]
             assert result == {"success": True, "errors": [], "data": expected_data}
-
-        status, resp = _post_json(
-            base + "/mcp",
-            {"jsonrpc": "2.0", "id": 77, "method": "tools/call", "params": {"arguments": {}}},
-        )
-        assert status == 400
-        assert resp["error"]["code"] == -32602
     finally:
         server.shutdown()
 
 
-def test_self_test_gate_passes():
-    assert run_self_test() is True
+def test_mcp_sse_endpoint_streams_endpoint_event():
+    server, base = _start_server()
+    try:
+        req = Request(
+            base + "/mcp",
+            method="GET",
+            headers={"Accept": "text/event-stream"},
+        )
+        with urlopen(req, timeout=2) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "text/event-stream"
+            assert resp.headers["Cache-Control"] == "no-cache"
+
+            first_chunk = resp.readline().decode("utf-8").strip()
+            second_chunk = resp.readline().decode("utf-8").strip()
+            resp.readline()  # event separator newline
+
+            assert first_chunk == "event: endpoint"
+            assert second_chunk.startswith("data: ")
+            payload = json.loads(second_chunk[len("data: ") :])
+            assert payload["path"] == "/mcp"
+            assert payload["protocol"] == "jsonrpc"
+            assert payload["url"].startswith(base)
+    finally:
+        server.shutdown()

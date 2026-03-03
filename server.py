@@ -1,12 +1,10 @@
 import json
-import os
 import re
-import threading
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
-from urllib.request import Request, urlopen
+from typing import Any, Dict, Tuple
 from urllib.parse import urlparse
 
 APP_NAME = "data-processing-suite"
@@ -98,11 +96,17 @@ TOOL_DEFINITIONS = [
 ]
 
 
-def success(data: dict[str, Any] | None) -> dict[str, Any]:
+@dataclass
+class Response:
+    status: int
+    body: Dict[str, Any] | None = None
+
+
+def success(data: Dict[str, Any] | None) -> Dict[str, Any]:
     return {"success": True, "errors": [], "data": data}
 
 
-def failure(code: str, message: str) -> dict[str, Any]:
+def failure(code: str, message: str) -> Dict[str, Any]:
     return {"success": False, "errors": [{"code": code, "message": message}], "data": None}
 
 
@@ -110,7 +114,7 @@ def _normalize(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
-def _word_count(text: str) -> dict[str, int]:
+def _word_count(text: str) -> Dict[str, int]:
     return {
         "chars": len(text),
         "words": len(text.split()),
@@ -133,11 +137,7 @@ def _replace(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
-def _jsonrpc_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
-
-
-def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if name == "text_normalize":
             return success({"text": _normalize(str(arguments["text"]))})
@@ -146,10 +146,7 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "slugify":
             return success({"slug": _slugify(str(arguments["text"]))})
         if name == "truncate":
-            max_length = int(arguments["max_length"])
-            if max_length < 0:
-                return failure("INVALID_ARGUMENT", "max_length must be >= 0")
-            return success({"text": _truncate(str(arguments["text"]), max_length)})
+            return success({"text": _truncate(str(arguments["text"]), int(arguments["max_length"]))})
         if name == "text_replace":
             return success({"text": _replace(str(arguments["text"]), str(arguments["old"]), str(arguments["new"]))})
         return failure("TOOL_NOT_FOUND", f"Unknown tool '{name}'")
@@ -159,19 +156,17 @@ def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return failure("INVALID_ARGUMENT", "Tool arguments are invalid")
 
 
-def handle_jsonrpc(payload: dict[str, Any]) -> tuple[int, dict[str, Any] | None]:
-    if not isinstance(payload, dict):
-        return HTTPStatus.BAD_REQUEST, _jsonrpc_error(None, -32600, "Invalid Request")
+def handle_jsonrpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]:
     if payload.get("jsonrpc") != "2.0" or "method" not in payload:
-        return HTTPStatus.BAD_REQUEST, _jsonrpc_error(payload.get("id"), -32600, "Invalid Request")
+        return HTTPStatus.BAD_REQUEST, {
+            "jsonrpc": "2.0",
+            "id": payload.get("id"),
+            "error": {"code": -32600, "message": "Invalid Request"},
+        }
 
     req_id = payload.get("id")
     method = payload["method"]
     params = payload.get("params", {})
-    if params is None:
-        params = {}
-    if not isinstance(params, dict):
-        return HTTPStatus.BAD_REQUEST, _jsonrpc_error(req_id, -32602, "Invalid params")
 
     if method == "initialize":
         result = {
@@ -188,24 +183,32 @@ def handle_jsonrpc(payload: dict[str, Any]) -> tuple[int, dict[str, Any] | None]
         return HTTPStatus.OK, {"jsonrpc": "2.0", "id": req_id, "result": {"acknowledged": True}}
 
     if method == "tools/list":
-        return HTTPStatus.OK, {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOL_DEFINITIONS}}
+        return HTTPStatus.OK, {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": TOOL_DEFINITIONS},
+        }
 
     if method == "tools/call":
-        if "name" not in params:
-            return HTTPStatus.BAD_REQUEST, _jsonrpc_error(req_id, -32602, "Invalid params: missing tool name")
-        if "arguments" in params and not isinstance(params["arguments"], dict):
-            return HTTPStatus.BAD_REQUEST, _jsonrpc_error(req_id, -32602, "Invalid params: arguments must be object")
-        name = str(params["name"])
+        name = params.get("name")
         arguments = params.get("arguments", {})
-        return HTTPStatus.OK, {"jsonrpc": "2.0", "id": req_id, "result": handle_tool_call(name, arguments)}
+        return HTTPStatus.OK, {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": handle_tool_call(str(name), arguments),
+        }
 
-    return HTTPStatus.BAD_REQUEST, _jsonrpc_error(req_id, -32601, f"Method not found: {method}")
+    return HTTPStatus.BAD_REQUEST, {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
 
 
 class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "DataProcessingSuite/1.1"
+    server_version = "DataProcessingSuite/1.0"
 
-    def _send_json(self, status: int, data: dict[str, Any] | None) -> None:
+    def _send_json(self, status: int, data: Dict[str, Any] | None) -> None:
         self.send_response(status)
         if data is None:
             self.end_headers()
@@ -216,24 +219,36 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_sse(self, status: int, event_data: str) -> None:
-        body = f"event: message\ndata: {event_data}\n\n".encode("utf-8")
-        self.send_response(status)
+    def _send_sse_event(self, event: str, data: Dict[str, Any]) -> None:
+        payload = json.dumps(data, separators=(",", ":"))
+        message = f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+        self.wfile.write(message)
+        self.wfile.flush()
+
+    def _handle_mcp_sse(self) -> None:
+        self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "keep-alive")
         self.end_headers()
-        self.wfile.write(body)
 
-    def _manifest(self) -> dict[str, Any]:
         host = self.headers.get("Host", "localhost:8000")
-        return {
-            "name": APP_NAME,
-            "version": APP_VERSION,
-            "base_url": f"http://{host}",
-            "tools": TOOL_DEFINITIONS,
-        }
+        self._send_sse_event(
+            "endpoint",
+            {
+                "path": "/mcp",
+                "url": f"http://{host}/mcp",
+                "protocol": "jsonrpc",
+            },
+        )
+
+        while True:
+            try:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                time.sleep(15)
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -253,11 +268,17 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"challenge": "static-placeholder"})
             return
         if path == "/mcp":
-            accept = self.headers.get("Accept", "")
-            if "text/event-stream" in accept:
-                self._send_sse(HTTPStatus.OK, json.dumps({"type": "ready", "name": APP_NAME, "version": APP_VERSION}))
+            if "text/event-stream" in self.headers.get("Accept", ""):
+                self._handle_mcp_sse()
                 return
-            self._send_json(HTTPStatus.OK, self._manifest())
+            host = self.headers.get("Host", "localhost:8000")
+            manifest = {
+                "name": APP_NAME,
+                "version": APP_VERSION,
+                "base_url": f"http://{host}",
+                "tools": TOOL_DEFINITIONS,
+            }
+            self._send_json(HTTPStatus.OK, manifest)
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
 
@@ -271,7 +292,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
         except (ValueError, json.JSONDecodeError):
-            self._send_json(HTTPStatus.BAD_REQUEST, _jsonrpc_error(None, -32700, "Parse error"))
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+            )
             return
 
         status, response = handle_jsonrpc(payload)
@@ -286,80 +310,5 @@ def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     server.serve_forever()
 
 
-def run_self_test() -> bool:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), RequestHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    time.sleep(0.05)
-    base = f"http://127.0.0.1:{server.server_address[1]}"
-
-    try:
-        with urlopen(base + "/health") as resp:
-            health = json.loads(resp.read().decode("utf-8"))
-            if resp.status != 200 or health != {"status": "ok"}:
-                return False
-
-        with urlopen(base + "/mcp") as resp:
-            manifest = json.loads(resp.read().decode("utf-8"))
-            if manifest.get("name") != APP_NAME or manifest.get("version") != APP_VERSION:
-                return False
-
-        init_req = Request(
-            base + "/mcp",
-            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(init_req) as resp:
-            init_body = json.loads(resp.read().decode("utf-8"))
-            if resp.status != 200 or "result" not in init_body:
-                return False
-
-        list_req = Request(
-            base + "/mcp",
-            data=json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(list_req) as resp:
-            list_body = json.loads(resp.read().decode("utf-8"))
-            tool_names = [tool["name"] for tool in list_body["result"]["tools"]]
-            if tool_names != ["text_normalize", "text_word_count", "slugify", "truncate", "text_replace"]:
-                return False
-
-        call_req = Request(
-            base + "/mcp",
-            data=json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "tools/call",
-                    "params": {"name": "text_normalize", "arguments": {"text": "  HeLLo   WORLD "}},
-                }
-            ).encode("utf-8"),
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(call_req) as resp:
-            call_body = json.loads(resp.read().decode("utf-8"))
-            expected = {"success": True, "errors": [], "data": {"text": "hello world"}}
-            if resp.status != 200 or call_body.get("result") != expected:
-                return False
-
-        source = open(__file__, "r", encoding="utf-8").read()
-        if '"0.0.0.0"' not in source or 'os.environ.get("PORT", "8000")' not in source:
-            return False
-
-        return True
-    finally:
-        server.shutdown()
-        thread.join(timeout=1)
-
-
 if __name__ == "__main__":
-    if os.environ.get("RUN_SELF_TEST", "0") == "1":
-        ok = run_self_test()
-        print(json.dumps({"self_test": "passed" if ok else "failed"}))
-        raise SystemExit(0 if ok else 1)
-
-    run_server(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
+    run_server()
