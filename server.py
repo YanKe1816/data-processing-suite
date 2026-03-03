@@ -1,11 +1,14 @@
 import json
+import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, cast
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 APP_NAME = "data-processing-suite"
 APP_VERSION = "1.0.0"
@@ -102,14 +105,6 @@ class Response:
     body: Dict[str, Any] | None = None
 
 
-def success(data: Dict[str, Any] | None) -> Dict[str, Any]:
-    return {"success": True, "errors": [], "data": data}
-
-
-def failure(code: str, message: str) -> Dict[str, Any]:
-    return {"success": False, "errors": [{"code": code, "message": message}], "data": None}
-
-
 def _normalize(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
@@ -137,26 +132,48 @@ def _replace(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
-def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+def handle_tool_call(name: str, arguments: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], str | None]:
     try:
         if name == "text_normalize":
-            return success({"text": _normalize(str(arguments["text"]))})
+            return True, {"text": _normalize(str(arguments["text"]))}, None
         if name == "text_word_count":
-            return success(_word_count(str(arguments["text"])))
+            return True, _word_count(str(arguments["text"])), None
         if name == "slugify":
-            return success({"slug": _slugify(str(arguments["text"]))})
+            return True, {"slug": _slugify(str(arguments["text"]))}, None
         if name == "truncate":
-            return success({"text": _truncate(str(arguments["text"]), int(arguments["max_length"]))})
+            return True, {"text": _truncate(str(arguments["text"]), int(arguments["max_length"]))}, None
         if name == "text_replace":
-            return success({"text": _replace(str(arguments["text"]), str(arguments["old"]), str(arguments["new"]))})
-        return failure("TOOL_NOT_FOUND", f"Unknown tool '{name}'")
+            return True, {"text": _replace(str(arguments["text"]), str(arguments["old"]), str(arguments["new"]))}, None
+        return False, {}, f"Unknown tool '{name}'"
     except KeyError as exc:
-        return failure("INVALID_ARGUMENT", f"Missing required argument: {exc.args[0]}")
+        return False, {}, f"Missing required argument: {exc.args[0]}"
     except (TypeError, ValueError):
-        return failure("INVALID_ARGUMENT", "Tool arguments are invalid")
+        return False, {}, "Tool arguments are invalid"
 
 
-def handle_jsonrpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]:
+def _tool_summary(name: str, output: Dict[str, Any]) -> str:
+    if name == "text_normalize":
+        return "Text normalized."
+    if name == "text_word_count":
+        return f"Counted {output.get('words', 0)} words."
+    if name == "slugify":
+        return "Slug generated."
+    if name == "truncate":
+        return "Text truncated."
+    if name == "text_replace":
+        return "Text replaced."
+    return "Tool executed."
+
+
+def _not_initialized_error(req_id: Any) -> Tuple[int, Dict[str, Any]]:
+    return HTTPStatus.OK, {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32000, "message": "Server not initialized"},
+    }
+
+
+def handle_jsonrpc(payload: Dict[str, Any], server: "MCPServer") -> Tuple[int, Dict[str, Any] | None]:
     if payload.get("jsonrpc") != "2.0" or "method" not in payload:
         return HTTPStatus.BAD_REQUEST, {
             "jsonrpc": "2.0",
@@ -178,11 +195,14 @@ def handle_jsonrpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]
         return HTTPStatus.OK, {"jsonrpc": "2.0", "id": req_id, "result": result}
 
     if method == "notifications/initialized":
+        server.initialized = True
         if req_id is None:
             return HTTPStatus.NO_CONTENT, None
         return HTTPStatus.OK, {"jsonrpc": "2.0", "id": req_id, "result": {"acknowledged": True}}
 
     if method == "tools/list":
+        if not server.initialized:
+            return _not_initialized_error(req_id)
         return HTTPStatus.OK, {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -190,12 +210,25 @@ def handle_jsonrpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]
         }
 
     if method == "tools/call":
-        name = params.get("name")
+        if not server.initialized:
+            return _not_initialized_error(req_id)
+        name = str(params.get("name"))
         arguments = params.get("arguments", {})
+        ok, tool_output, error_message = handle_tool_call(name, arguments)
+        if not ok:
+            return HTTPStatus.OK, {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": error_message or "Invalid params"},
+            }
+
         return HTTPStatus.OK, {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": handle_tool_call(str(name), arguments),
+            "result": {
+                "content": [{"type": "text", "text": _tool_summary(name, tool_output)}],
+                "structuredContent": tool_output,
+            },
         }
 
     return HTTPStatus.BAD_REQUEST, {
@@ -203,6 +236,12 @@ def handle_jsonrpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]
         "id": req_id,
         "error": {"code": -32601, "message": f"Method not found: {method}"},
     }
+
+
+class MCPServer(ThreadingHTTPServer):
+    def __init__(self, server_address: Tuple[str, int], handler_cls: type[BaseHTTPRequestHandler]):
+        super().__init__(server_address, handler_cls)
+        self.initialized = False
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -218,6 +257,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
+
+    def _send_text(self, status: int, text: str) -> None:
+        payload = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _send_sse_event(self, event: str, data: Dict[str, Any]) -> None:
         payload = json.dumps(data, separators=(",", ":"))
@@ -262,10 +309,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"terms": "Use as-is. No warranties."})
             return
         if path == "/support":
-            self._send_json(HTTPStatus.OK, {"support": "Open an issue in the repository for support."})
+            self._send_json(HTTPStatus.OK, {"support": "Open an issue in the repository for support.", "email": "support@example.com"})
             return
         if path == "/.well-known/openai-apps-challenge":
-            self._send_json(HTTPStatus.OK, {"challenge": "static-placeholder"})
+            challenge = os.environ.get("OPENAI_APPS_CHALLENGE", "PLACEHOLDER")
+            self._send_text(HTTPStatus.OK, challenge)
             return
         if path == "/mcp":
             if "text/event-stream" in self.headers.get("Accept", ""):
@@ -298,7 +346,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        status, response = handle_jsonrpc(payload)
+        mcp_server = cast(MCPServer, self.server)
+        status, response = handle_jsonrpc(payload, mcp_server)
         self._send_json(status, response)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
@@ -306,9 +355,67 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
-    server = ThreadingHTTPServer((host, port), RequestHandler)
+    server = MCPServer((host, port), RequestHandler)
     server.serve_forever()
 
 
+def run_self_test() -> None:
+    test_server = MCPServer(("127.0.0.1", 0), RequestHandler)
+    host, port = test_server.server_address
+    thread = threading.Thread(target=test_server.serve_forever, daemon=True)
+    thread.start()
+
+    base = f"http://{host}:{port}"
+
+    def get_json(path: str) -> Dict[str, Any]:
+        with urlopen(f"{base}{path}") as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def rpc(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any] | None]:
+        req = Request(
+            f"{base}/mcp",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req) as response:
+            body = response.read().decode("utf-8")
+            return response.getcode(), json.loads(body) if body else None
+
+    try:
+        health = get_json("/health")
+        assert health == {"status": "ok"}, "health endpoint did not return expected payload"
+
+        _, initialize = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        assert initialize and "protocolVersion" in initialize.get("result", {}), "initialize missing protocolVersion"
+
+        _, pre_init_list = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        assert pre_init_list and pre_init_list.get("error", {}).get("code") == -32000, "tools/list should fail before initialized"
+
+        rpc({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+        _, post_init_list = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}})
+        assert post_init_list and "tools" in post_init_list.get("result", {}), "tools/list should succeed after initialized"
+
+        _, tool_call = rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "text_normalize", "arguments": {"text": "  Hello   WORLD "}},
+            }
+        )
+        result = (tool_call or {}).get("result", {})
+        assert isinstance(result.get("content"), list), "tools/call result.content must be an array"
+
+        print("Self-test passed")
+    finally:
+        test_server.shutdown()
+        test_server.server_close()
+
+
 if __name__ == "__main__":
-    run_server()
+    if os.environ.get("RUN_SELF_TEST") == "1":
+        run_self_test()
+    else:
+        run_server(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
