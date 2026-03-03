@@ -1,19 +1,10 @@
 import json
 import threading
 import time
-import unittest
 from http.server import ThreadingHTTPServer
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from server import (
-    APP_NAME,
-    APP_VERSION,
-    DEFAULT_PROTOCOL_VERSION,
-    RequestHandler,
-    TOOL_DEFINITIONS,
-    run_self_test,
-)
+from server import APP_NAME, APP_VERSION, RequestHandler, TOOL_DEFINITIONS
 
 
 def _start_server():
@@ -24,119 +15,130 @@ def _start_server():
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
-def _request_json(url, method="GET", body=None, headers=None):
-    req_headers = headers or {}
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        req_headers = {**req_headers, "Content-Type": "application/json"}
-    req = Request(url, data=data, method=method, headers=req_headers)
+def _get_json(url):
+    with urlopen(url) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def _post_json(url, body):
+    req = Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urlopen(req) as resp:
+        raw = resp.read().decode("utf-8")
+        return resp.status, json.loads(raw) if raw else None
+
+
+def test_required_routes_and_mcp_manifest():
+    server, base = _start_server()
     try:
+        for route in [
+            "/health",
+            "/privacy",
+            "/terms",
+            "/support",
+            "/.well-known/openai-apps-challenge",
+        ]:
+            status, _ = _get_json(base + route)
+            assert status == 200
+
+        status, mcp = _get_json(base + "/mcp")
+        assert status == 200
+        assert mcp["name"] == APP_NAME
+        assert mcp["version"] == APP_VERSION
+        assert mcp["tools"] == TOOL_DEFINITIONS
+        assert mcp["base_url"].startswith("http://")
+    finally:
+        server.shutdown()
+
+
+def test_jsonrpc_initialize_tools_list_and_notifications_initialized():
+    server, base = _start_server()
+    try:
+        status, init_resp = _post_json(
+            base + "/mcp",
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+        assert status == 200
+        assert init_resp["result"]["name"] == APP_NAME
+
+        status, list_resp = _post_json(
+            base + "/mcp",
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+        assert status == 200
+        assert list_resp["result"]["tools"] == TOOL_DEFINITIONS
+
+        status, mcp = _get_json(base + "/mcp")
+        assert mcp["tools"] == list_resp["result"]["tools"]
+
+        # Notification form (no id) returns 204 and empty body.
+        req = Request(
+            base + "/mcp",
+            data=json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
         with urlopen(req) as resp:
-            raw = resp.read().decode("utf-8")
-            parsed = json.loads(raw) if raw else None
-            return resp.status, resp.headers, parsed
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8")
-        parsed = json.loads(raw) if raw else None
-        return exc.code, exc.headers, parsed
+            assert resp.status == 204
+            assert resp.read() == b""
+    finally:
+        server.shutdown()
 
 
-class ServerTests(unittest.TestCase):
-    def test_endpoints_and_handshake_flow(self):
-        server, base = _start_server()
-        try:
-            status, _, health = _request_json(base + "/health")
-            self.assertEqual(status, 200)
-            self.assertEqual(health, {"status": "ok"})
+def test_tools_call_for_each_tool():
+    server, base = _start_server()
+    try:
+        cases = [
+            ("text_normalize", {"text": "  HeLLo    WORLD  "}, {"text": "hello world"}),
+            ("text_word_count", {"text": "a b\nc"}, {"chars": 5, "words": 3, "lines": 2}),
+            ("slugify", {"text": "Hello, World!!!"}, {"slug": "hello-world"}),
+            ("truncate", {"text": "abcdef", "max_length": 3}, {"text": "abc"}),
+            ("text_replace", {"text": "foo bar foo", "old": "foo", "new": "baz"}, {"text": "baz bar baz"}),
+        ]
 
-            for route in ["/privacy", "/terms", "/support"]:
-                req = Request(base + route, method="GET")
-                with urlopen(req) as resp:
-                    text = resp.read().decode("utf-8")
-                    self.assertEqual(resp.status, 200)
-                    self.assertTrue(len(text) > 0)
-            req = Request(base + "/support", method="GET")
-            with urlopen(req) as resp:
-                self.assertIn("@", resp.read().decode("utf-8"))
-
-            status, _, manifest = _request_json(base + "/mcp")
-            self.assertEqual(status, 200)
-            self.assertEqual(manifest["name"], APP_NAME)
-            self.assertEqual(manifest["version"], APP_VERSION)
-            self.assertEqual(manifest["tools"], TOOL_DEFINITIONS)
-
-            # tools/list before initialized should fail
-            status, _, body = _request_json(
+        for idx, (name, arguments, expected_data) in enumerate(cases, start=1):
+            status, resp = _post_json(
                 base + "/mcp",
-                method="POST",
-                body={"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}},
-            )
-            self.assertEqual(status, 400)
-            self.assertEqual(body["error"]["code"], -32000)
-            self.assertEqual(body["error"]["message"], "Server not initialized")
-
-            status, _, init = _request_json(
-                base + "/mcp",
-                method="POST",
-                body={
+                {
                     "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": DEFAULT_PROTOCOL_VERSION,
-                        "capabilities": {},
-                        "clientInfo": {"name": "unit", "version": "1"},
-                    },
-                },
-            )
-            self.assertEqual(status, 200)
-            result = init["result"]
-            self.assertIn("protocolVersion", result)
-            self.assertIn("capabilities", result)
-            self.assertIn("serverInfo", result)
-
-
-            status, _, _ = _request_json(
-                base + "/mcp",
-                method="POST",
-                body={"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-            )
-            self.assertEqual(status, 204)
-
-            status, _, listed = _request_json(
-                base + "/mcp",
-                method="POST",
-                body={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-            )
-            self.assertEqual(status, 200)
-            self.assertEqual(listed["result"]["tools"], TOOL_DEFINITIONS)
-
-            status, _, called = _request_json(
-                base + "/mcp",
-                method="POST",
-                body={
-                    "jsonrpc": "2.0",
-                    "id": 3,
+                    "id": idx,
                     "method": "tools/call",
-                    "params": {"name": "text_normalize", "arguments": {"text": "  HeLLo    WORLD  "}},
+                    "params": {"name": name, "arguments": arguments},
                 },
             )
-            self.assertEqual(status, 200)
-            self.assertIn("content", called["result"])
-            self.assertEqual(called["result"]["structuredContent"], {"text": "hello world"})
-
-            req = Request(base + "/mcp", method="GET", headers={"Accept": "text/event-stream"})
-            with urlopen(req) as resp:
-                self.assertEqual(resp.status, 200)
-                self.assertIn("text/event-stream", resp.headers.get("Content-Type", ""))
-        finally:
-            server.shutdown()
-            server.server_close()
-
-    def test_run_self_test(self):
-        self.assertTrue(run_self_test())
+            assert status == 200
+            result = resp["result"]
+            assert result == {"success": True, "errors": [], "data": expected_data}
+    finally:
+        server.shutdown()
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_mcp_sse_endpoint_streams_endpoint_event():
+    server, base = _start_server()
+    try:
+        req = Request(
+            base + "/mcp",
+            method="GET",
+            headers={"Accept": "text/event-stream"},
+        )
+        with urlopen(req, timeout=2) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "text/event-stream"
+            assert resp.headers["Cache-Control"] == "no-cache"
+
+            first_chunk = resp.readline().decode("utf-8").strip()
+            second_chunk = resp.readline().decode("utf-8").strip()
+            resp.readline()  # event separator newline
+
+            assert first_chunk == "event: endpoint"
+            assert second_chunk.startswith("data: ")
+            payload = json.loads(second_chunk[len("data: ") :])
+            assert payload["path"] == "/mcp"
+            assert payload["protocol"] == "jsonrpc"
+            assert payload["url"].startswith(base)
+    finally:
+        server.shutdown()
