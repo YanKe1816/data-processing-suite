@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -218,6 +219,37 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_sse_event(self, event: str, data: Dict[str, Any]) -> None:
+        payload = json.dumps(data, separators=(",", ":"))
+        message = f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+        self.wfile.write(message)
+        self.wfile.flush()
+
+    def _handle_mcp_sse(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        host = self.headers.get("Host", "localhost:8000")
+        self._send_sse_event(
+            "endpoint",
+            {
+                "path": "/mcp",
+                "url": f"http://{host}/mcp",
+                "protocol": "jsonrpc",
+            },
+        )
+
+        while True:
+            try:
+                self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                time.sleep(15)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/health":
@@ -236,6 +268,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"challenge": "static-placeholder"})
             return
         if path == "/mcp":
+            if "text/event-stream" in self.headers.get("Accept", ""):
+                self._handle_mcp_sse()
+                return
             host = self.headers.get("Host", "localhost:8000")
             manifest = {
                 "name": APP_NAME,

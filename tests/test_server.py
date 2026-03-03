@@ -115,3 +115,30 @@ def test_tools_call_for_each_tool():
             assert result == {"success": True, "errors": [], "data": expected_data}
     finally:
         server.shutdown()
+
+
+def test_mcp_sse_endpoint_streams_endpoint_event():
+    server, base = _start_server()
+    try:
+        req = Request(
+            base + "/mcp",
+            method="GET",
+            headers={"Accept": "text/event-stream"},
+        )
+        with urlopen(req, timeout=2) as resp:
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "text/event-stream"
+            assert resp.headers["Cache-Control"] == "no-cache"
+
+            first_chunk = resp.readline().decode("utf-8").strip()
+            second_chunk = resp.readline().decode("utf-8").strip()
+            resp.readline()  # event separator newline
+
+            assert first_chunk == "event: endpoint"
+            assert second_chunk.startswith("data: ")
+            payload = json.loads(second_chunk[len("data: ") :])
+            assert payload["path"] == "/mcp"
+            assert payload["protocol"] == "jsonrpc"
+            assert payload["url"].startswith(base)
+    finally:
+        server.shutdown()
